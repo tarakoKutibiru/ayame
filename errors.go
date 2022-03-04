@@ -26,7 +26,9 @@ var (
 
 	errConfigInvalidLogLevel = errors.New("ConfigInvalidLogLevel")
 
-	errRoomFull = errors.New("RoomFull")
+	errRoomNotExisted = errors.New("RoomNotExisted")
+	errRoomExisted    = errors.New("RoomExisted")
+	errRoomFull       = errors.New("RoomFull")
 	// 想定外のエラー
 	errInternalServer = errors.New("InternalServerError")
 )

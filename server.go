@@ -1,8 +1,8 @@
 package main
 
 var (
-	// register/unregister は待たせる
-	registerChannel   = make(chan *register)
+	makeChannel       = make(chan *register)
+	joinChannel       = make(chan *register)
 	unregisterChannel = make(chan *unregister)
 	// ブロックされたくないので 100 に設定
 	forwardChannel = make(chan forward, 100)
@@ -19,20 +19,13 @@ func server() {
 	// ここはシングルなのでロックは不要
 	for {
 		select {
-		case register := <-registerChannel:
-			c := register.connection
-			rch := register.resultChannel
-			r, ok := m[c.roomID]
+		case makeRoom := <-makeChannel:
+			c := makeRoom.connection
+			rch := makeRoom.resultChannel
+			_, ok := m[c.roomID]
 			if ok {
 				// room があった
-				if len(r.connections) == 1 {
-					r.connections[c.ID] = c
-					m[c.roomID] = r
-					rch <- two
-				} else {
-					// room あったけど満杯
-					rch <- full
-				}
+				rch <- exists
 			} else {
 				// room がなかった
 				var connections = make(map[string]*connection)
@@ -42,7 +35,25 @@ func server() {
 					connections: connections,
 				}
 				c.debugLog().Msg("CREATED-ROOM")
-				rch <- one
+				rch <- create
+			}
+		case joinRoom := <-joinChannel:
+			c := joinRoom.connection
+			rch := joinRoom.resultChannel
+			r, ok := m[c.roomID]
+			if ok {
+				// room があった
+				if len(r.connections) == 1 {
+					r.connections[c.ID] = c
+					m[c.roomID] = r
+					rch <- join
+				} else {
+					// room あったけど満杯
+					rch <- full
+				}
+			} else {
+				// room がなかった
+				rch <- none
 			}
 		case unregister := <-unregisterChannel:
 			c := unregister.connection

@@ -115,9 +115,22 @@ func (c *connection) closeWs() {
 	c.debugLog().Msg("CLOSED-WS")
 }
 
-func (c *connection) register() int {
+func (c *connection) makeRoom() int {
 	resultChannel := make(chan int)
-	registerChannel <- &register{
+	makeChannel <- &register{
+		connection:    c,
+		resultChannel: resultChannel,
+	}
+	// ここはブロックする candidate とかを並列で来てるかもしれないが知らん
+	result := <-resultChannel
+	// もう server で触ることはないのでここで閉じる
+	close(resultChannel)
+	return result
+}
+
+func (c *connection) joinRoom() int {
+	resultChannel := make(chan int)
+	joinChannel <- &register{
 		connection:    c,
 		resultChannel: resultChannel,
 	}
@@ -263,7 +276,7 @@ func (c *connection) handleWsMessage(rawMessage []byte, pongTimeoutTimer *time.T
 	case "pong":
 		timerStop(pongTimeoutTimer)
 		pongTimeoutTimer.Reset(pongTimeout * time.Second)
-	case "register":
+	case "make_room":
 		// すでに登録されているのにもう一度登録しに来た
 		if c.registered {
 			c.errLog().Bytes("rawMessage", rawMessage).Msg("InternalServer")
@@ -345,23 +358,126 @@ func (c *connection) handleWsMessage(rawMessage []byte, pongTimeoutTimer *time.T
 		c.authzMetadata = resp.AuthzMetadata
 
 		// 戻り値は手抜き
-		switch c.register() {
-		case one:
+		switch c.makeRoom() {
+		case create:
 			c.registered = true
 			// room がまだなかった、accept を返す
-			c.debugLog().Msg("REGISTERED-ONE")
+			c.debugLog().Msg("REGISTERED-CREATE")
 			if err := c.sendAcceptMessage(false, resp.IceServers, resp.AuthzMetadata); err != nil {
 				c.errLog().Err(err).Msg("FailedSendAcceptMessage")
 				return err
 			}
-		case two:
+		case exists:
+			// room が満杯だった
+			c.errLog().Msg("RoomExisted")
+			if err := c.sendRejectMessage("exists"); err != nil {
+				c.errLog().Err(err).Msg("FailedSendRejectMessage")
+				return err
+			}
+			return errRoomExisted
+		}
+
+	case "join_room":
+		// すでに登録されているのにもう一度登録しに来た
+		if c.registered {
+			c.errLog().Bytes("rawMessage", rawMessage).Msg("InternalServer")
+			return errInternalServer
+		}
+
+		c.ID = getULID()
+
+		registerMessage := &registerMessage{}
+		if err := json.Unmarshal(rawMessage, &registerMessage); err != nil {
+			c.errLog().Err(err).Bytes("rawMessage", rawMessage).Msg("InvalidRegisterMessageJSON")
+			return errInvalidJSON
+		}
+
+		if registerMessage.RoomID == "" {
+			c.errLog().Bytes("rawMessage", rawMessage).Msg("MissingRoomID")
+			return errMissingRoomID
+		}
+		c.roomID = registerMessage.RoomID
+
+		c.clientID = registerMessage.ClientID
+		if registerMessage.ClientID == "" {
+			c.clientID = c.ID
+		}
+
+		// 下位互換性
+		if registerMessage.Key != nil {
+			c.signalingKey = registerMessage.Key
+		}
+
+		if registerMessage.SignalingKey != nil {
+			c.signalingKey = registerMessage.SignalingKey
+		}
+
+		c.authnMetadata = registerMessage.AuthnMetadata
+
+		// クライアント情報の登録
+		c.ayameClient = registerMessage.AyameClient
+		c.environment = registerMessage.Environment
+		c.libwebrtc = registerMessage.Libwebrtc
+
+		// Webhook 系のエラーログは Caller をつける
+		resp, err := c.authnWebhook()
+		if err != nil {
+			c.errLog().Err(err).Caller().Msg("AuthnWebhookError")
+			if err := c.sendRejectMessage("InternalServerError"); err != nil {
+				c.errLog().Err(err).Caller().Msg("FailedSendRejectMessage")
+				return err
+			}
+			return err
+		}
+
+		// 認証サーバの戻り値がおかしい場合は全部 Error にする
+		if resp.Allowed == nil {
+			c.errLog().Caller().Msg("AuthnWebhookResponseError")
+			if err := c.sendRejectMessage("InternalServerError"); err != nil {
+				c.errLog().Err(err).Caller().Msg("FailedSendRejectMessage")
+				return err
+			}
+			return errAuthnWebhookResponse
+		}
+
+		if !*resp.Allowed {
+			if resp.Reason == nil {
+				c.errLog().Caller().Msg("AuthnWebhookResponseError")
+				if err := c.sendRejectMessage("InternalServerError"); err != nil {
+					c.errLog().Err(err).Caller().Msg("FailedSendRejectMessage")
+					return err
+				}
+				return errAuthnWebhookResponse
+			}
+			if err := c.sendRejectMessage(*resp.Reason); err != nil {
+				c.errLog().Err(err).Caller().Msg("FailedSendRejectMessage")
+				return err
+			}
+			return errAuthnWebhookReject
+		}
+
+		c.authzMetadata = resp.AuthzMetadata
+
+		// 戻り値は手抜き
+		switch c.joinRoom() {
+		case join:
 			c.registered = true
 			// room がすでにあって、一人いた、二人目
-			c.debugLog().Msg("REGISTERED-TWO")
+			c.debugLog().Msg("REGISTERED-JOIN")
 			if err := c.sendAcceptMessage(true, resp.IceServers, resp.AuthzMetadata); err != nil {
 				c.errLog().Err(err).Msg("FailedSendAcceptMessage")
 				return err
 			}
+
+		case none:
+			// roomが存在しない
+			c.errLog().Msg("RoomNotExist")
+			if err := c.sendRejectMessage("not_exist"); err != nil {
+				c.errLog().Err(err).Msg("FailedSendRejectMessage")
+				return err
+			}
+			return errRoomNotExisted
+
 		case full:
 			// room が満杯だった
 			c.errLog().Msg("RoomFilled")
